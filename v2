@@ -1,0 +1,150 @@
+
+Крок 1. Оновлення системи та встановлення пакетівЗайдіть на Raspberry Pi через термінал (або по SSH під вашим користувачем, наприклад prof) і виконайте встановлення кодера FFmpeg та стрімера uStreamer:bash
+
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y ffmpeg ustreamer
+Будьте обачні, використовуючи код.
+
+Крок 2. Фізичне підключення кнопки та світлодіода (LED)Використовуємо стандартну 40-пінову гребінку GPIO на Raspberry Pi 5.
+Кнопка (без фіксації):Один контакт ➔ GPIO 26 (фізичний пін №37).Другий контакт ➔ GND (Земля, наприклад, фізичний пін №39 поруч).
+Світлодіод (LED):Довга ніжка (+, Анод) ➔ через резистор 220 Ом ➔ до GPIO 17 (фізичний пін №11).Коротка ніжка (-, Катод) ➔ до будь-якого контакту GND (наприклад, фізичний пін №9 або №14).
+
+Крок 3. Налаштування універсальної папки для будь-якої флешкиЩоб скрипт не залежав від назви флешки (ESD-USB тощо), ми налаштуємо систему так, щоб будь-яка вставлена USB-флешка автоматично монтувалася в одну й ту саму папку /mnt/usb.Створіть постійну папку в системі:bash
+
+sudo mkdir -p /mnt/usb
+sudo chmod 777 /mnt/usb
+Будьте обачні, використовуючи код.
+
+Налаштуємо автоматичне монтування за допомогою системного правила. Створіть файл правила:bash
+
+sudo nano /etc/udev/rules.d/99-usb-automount.rules
+Будьте обачні, використовуючи код.
+
+Вставте туди такий рядок (він перехоплює першу вставлену флешку sda1 і монтує її в /mnt/usb):ini
+
+ACTION=="add", SUBSYSTEMS=="usb", KERNEL=="sd[a-z][0-9]", RUN+="/usr/bin/mount -o uid=1000,gid=1000,umask=000 /dev/%k /mnt/usb"
+ACTION=="remove", SUBSYSTEMS=="usb", KERNEL=="sd[a-z][0-9]", RUN+="/usr/bin/umount /mnt/usb"
+Будьте обачні, використовуючи код.
+
+Збережіть файл (Ctrl+O, Enter, Ctrl+X) та оновіть правила:bash
+
+sudo udevadm control --reload-rules
+Будьте обачні, використовуючи код.
+
+Крок 4. Створення головного керуючого скрипту PythonЦей скрипт працює через офіційну вбудовану бібліотеку gpiod. Він постійно слухає кнопку на GPIO 26. При натисканні: запускає запис на флешку (в універсальну папку /mnt/usb/dvr_records) та подає струм на GPIO 17, щоб засвітити діод. При повторному натисканні: гасить діод і безпечно зупиняє FFmpeg.
+Створіть файл скрипту:bash
+
+nano ~/dvr_button_led.py
+Будьте обачні, використовуючи код.
+
+Вставте в нього наступний повний код:python
+
+import time
+import subprocess
+import os
+import gpiod
+from gpiod.line import Direction, Value, Bias
+
+BUTTON_PIN = 26
+LED_PIN = 17
+process = None
+CHIP_PATH = '/dev/gpiochip4'  # Для Raspberry Pi 5
+
+TARGET_DIR = "/mnt/usb/dvr_records"
+
+try:
+    # Запитуємо лінії для Кнопки (вхід з підтяжкою) та Світлодіода (вихід)
+    with gpiod.request_lines(
+        CHIP_PATH,
+        config={
+            BUTTON_PIN: gpiod.LineSettings(direction=Direction.INPUT, bias=Bias.PULL_UP),
+            LED_PIN: gpiod.LineSettings(direction=Direction.OUTPUT, output_value=Value.INACTIVE)
+        }
+    ) as lines:
+        
+        print("Комплекс DVR + LED готовий. Очікування кнопки...")
+        
+        while True:
+            button_state = lines.get_value(BUTTON_PIN)
+            
+            # Якщо кнопку натиснуто (значення 0 / INACTIVE)
+            if button_state == Value.INACTIVE or button_state == 0:
+                if process is None:
+                    print("Старт запису...")
+                    # Перевіряємо, чи вставлена флешка (чи існує папка монтування)
+                    if os.path.ismount('/mnt/usb') or os.path.exists('/mnt/usb'):
+                        os.makedirs(TARGET_DIR, exist_ok=True)
+                        
+                        # Вмикаємо світлодіод
+                        lines.set_value(LED_PIN, Value.ACTIVE)
+                        
+                        # Запуск FFmpeg запису у фоні шматками по 10 хвилин
+                        cmd = (
+                            f"ffmpeg -f v4l2 -input_format mjpeg -video_size 640x480 -framerate 30 "
+                            f"-fflags +genpts+discardcorrupt+nobuffer -max_delay 100000 -i /dev/video0 "
+                            f"-c:v libx264 -preset ultrafast -crf 26 -g 30 -sn -an -f segment "
+                            f"-segment_time 600 -segment_format mp4 -strftime 1 -reset_timestamps 1 "
+                            f"\"{TARGET_DIR}/fpv_%Y-%m-%d_%H-%M-%S.mp4\""
+                        )
+                        process = subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    else:
+                        print("Помилка: Флешку не знайдено в /mnt/usb!")
+                else:
+                    print("Зупинка запису...")
+                    # Вимикаємо світлодіод
+                    lines.set_value(LED_PIN, Value.INACTIVE)
+                    # Коректно закриваємо FFmpeg
+                    process.terminate()
+                    process.wait()
+                    process = None
+                    print("Файл збережено.")
+                
+                time.sleep(1.5)  # Захист від брязкоту контактів
+                
+            time.sleep(0.1)
+
+except Exception as e:
+    print(f"Помилка GPIO заліза: {e}")
+Будьте обачні, використовуючи код.
+
+Збережіть та закрийте файл (Ctrl+O, Enter, Ctrl+X).Крок 5. Створення та запуск служб автоматизаціїСтворимо дві незалежні фонові служби: одна для постійного онлайн-стріму в Delta, інша — для роботи нашого скрипту кнопки та світлодіода.Служба онлайн трансляції (uStreamer):bashsudo nano /etc/systemd/system/ustreamer.service
+Будьте обачні, використовуючи код.
+
+Вставте текст:ini
+
+[Unit]
+Description=uStreamer FPV Live Stream Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/ustreamer --device=/dev/video0 --format=mjpeg --resolution=640x480 --desired-fps=30 --host=0.0.0.0 --port=8554 --allow-origin=* --workers=3
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+Будьте обачні, використовуючи код.Служба реєстратора та кнопки (dvr_button):bashsudo nano /etc/systemd/system/dvr_button.service
+Будьте обачні, використовуючи код.Вставте текст (замініть prof на ваше актуальне ім'я користувача, якщо воно інше):ini[Unit]
+Description=DVR Button and LED Service
+After=local-fs.target network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 /home/prof/dvr_button_led.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+Будьте обачні, використовуючи код.
+
+Активація та старт усього комплексу:bash
+
+sudo systemctl daemon-reload
+sudo systemctl enable ustreamer.service dvr_button.service
+sudo systemctl start ustreamer.service dvr_button.service
+Будьте обачні, використовуючи код.
+
