@@ -3,6 +3,8 @@
 
 sudo apt update && sudo apt upgrade -y
 sudo apt install -y ffmpeg ustreamer
+sudo apt install -y ffmpeg mpv v4l-utils
+
 Будьте обачні, використовуючи код.
 
 Крок 2. Фізичне підключення кнопки та світлодіода (LED)Використовуємо стандартну 40-пінову гребінку GPIO на Raspberry Pi 5.
